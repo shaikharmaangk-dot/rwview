@@ -1,0 +1,149 @@
+name: Build ARVIEW for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "rustdesk-master.zip"
+      - ".github/workflows/build-windows.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout rwview repository
+        uses: actions/checkout@v4
+
+      - name: Get existing RustDesk source archive
+        uses: actions/checkout@v4
+        with:
+          repository: shaikharmaangk-dot/arview
+          path: source-archive
+
+      - name: Extract RustDesk source archive
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:GITHUB_WORKSPACE "source-archive/rustdesk-master.zip"
+          if (!(Test-Path $archive)) {
+            throw "rustdesk-master.zip was not found in the existing arview repository."
+          }
+          Expand-Archive -Path $archive -DestinationPath "$env:RUNNER_TEMP/rustdesk-src" -Force
+          $root = Get-ChildItem "$env:RUNNER_TEMP/rustdesk-src" -Directory | Select-Object -First 1
+          if (!$root -or !(Test-Path (Join-Path $root.FullName "Cargo.toml"))) {
+            throw "The ZIP must contain the RustDesk source tree with Cargo.toml at its top level."
+          }
+          "RUSTDESK_SRC=$($root.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Restore hbb_common submodule
+        shell: pwsh
+        run: |
+          $submodule = Join-Path $env:RUSTDESK_SRC "libs/hbb_common"
+          if (!(Test-Path (Join-Path $submodule "Cargo.toml"))) {
+            if (Test-Path $submodule) { Remove-Item $submodule -Recurse -Force }
+            New-Item -ItemType Directory -Force -Path (Split-Path $submodule) | Out-Null
+            git clone --depth 1 https://github.com/rustdesk/hbb_common.git $submodule
+          }
+          if (!(Test-Path (Join-Path $submodule "Cargo.toml"))) {
+            throw "Could not find libs/hbb_common/Cargo.toml after restoring the submodule."
+          }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install CMake and NASM
+        uses: lukka/get-cmake@latest
+
+      - name: Install vcpkg dependencies
+        shell: pwsh
+        env:
+          VCPKG_DEFAULT_TRIPLET: x64-windows-static
+        run: |
+          Set-Location $env:RUSTDESK_SRC
+          vcpkg install --triplet x64-windows-static
+          if (!$env:VCPKG_INSTALLATION_ROOT) {
+            throw "VCPKG_INSTALLATION_ROOT is not set on this runner."
+          }
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          # The source archive can carry an older vcpkg baseline. Reinstall libvpx
+          # from the current vcpkg registry in classic mode so its public headers
+          # (especially vpx/vp8.h) are actually present in the global triplet.
+          $classicDir = Join-Path $env:RUNNER_TEMP "vcpkg-classic"
+          New-Item -ItemType Directory -Force -Path $classicDir | Out-Null
+          Push-Location $classicDir
+          try {
+            vcpkg remove libvpx:x64-windows-static
+            vcpkg install libvpx:x64-windows-static
+          }
+          finally {
+            Pop-Location
+          }
+
+          $vpxHeader = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed/x64-windows-static/include/vpx/vp8.h"
+          if (!(Test-Path $vpxHeader)) {
+            Write-Host "Installed include directories:"
+            Get-ChildItem (Join-Path $env:VCPKG_INSTALLATION_ROOT "installed/x64-windows-static/include") -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+            throw "libvpx installation is incomplete: vpx/vp8.h is still missing at $vpxHeader"
+          }
+
+          # Manifest-mode vcpkg may install into the source tree's vcpkg_installed directory.
+          # Non-manifest mode installs into VCPKG_ROOT/installed. Check both locations.
+          $candidateIncludes = @(
+            (Join-Path $env:RUSTDESK_SRC "vcpkg_installed/x64-windows-static/include"),
+            (Join-Path $env:VCPKG_INSTALLATION_ROOT "installed/x64-windows-static/include"),
+            (Join-Path $env:VCPKG_INSTALLATION_ROOT "installed/x64-windows/include")
+          )
+          $opusInclude = $candidateIncludes | Where-Object {
+            (Test-Path (Join-Path $_ "opus/opus_multistream.h")) -or
+            (Test-Path (Join-Path $_ "opus_multistream.h"))
+          } | Select-Object -First 1
+
+          if (!$opusInclude) {
+            Write-Host "Searching vcpkg install directories for Opus headers..."
+            $opusHeaderFound = Get-ChildItem $env:RUSTDESK_SRC,$env:VCPKG_INSTALLATION_ROOT -Filter "opus_multistream.h" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($opusHeaderFound) { $opusInclude = $opusHeaderFound.Directory.FullName }
+          }
+          if (!$opusInclude) {
+            throw "Opus headers were not found in manifest-mode or classic vcpkg install directories."
+          }
+
+          $opusHeader = Join-Path $opusInclude "opus/opus_multistream.h"
+          if (!(Test-Path $opusHeader)) {
+            $flatHeader = Join-Path $opusInclude "opus_multistream.h"
+            if (Test-Path $flatHeader) {
+              $opusDir = Join-Path $opusInclude "opus"
+              New-Item -ItemType Directory -Force -Path $opusDir | Out-Null
+              Get-ChildItem $opusInclude -Filter "*.h" -File | Copy-Item -Destination $opusDir -Force
+            }
+          }
+          if (!(Test-Path (Join-Path $opusInclude "opus/opus_multistream.h"))) {
+            throw "Opus headers were found at $opusInclude but could not be arranged under include/opus/."
+          }
+
+      - name: Build ARVIEW
+        shell: pwsh
+        env:
+          VCPKG_DEFAULT_TRIPLET: x64-windows-static
+        run: |
+          Set-Location $env:RUSTDESK_SRC
+          cargo build --release --locked
+          $exe = Join-Path $env:RUSTDESK_SRC "target/release/rustdesk.exe"
+          if (!(Test-Path $exe)) {
+            throw "Build finished but target/release/rustdesk.exe was not found."
+          }
+          Copy-Item $exe "$env:GITHUB_WORKSPACE/ARVIEW.exe" -Force
+
+      - name: Upload ARVIEW EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: arview-windows-x64
+          path: ARVIEW.exe
+          if-no-files-found: error
+          retention-days: 14
